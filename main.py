@@ -35,6 +35,12 @@ class TrendbarRequest(BaseModel):
     weeks: Optional[int] = 6
 
 
+class TradeSignalRequest(BaseModel):
+    pair: str
+    timeframe: Optional[str] = None
+    weeks: Optional[int] = 6
+
+
 class NewsRequest(BaseModel):
     pair: Optional[str] = None
     impact: Optional[str] = None  # "high", "medium", "low", or None for all
@@ -168,6 +174,62 @@ async def get_trendbar_get(pair: str, timeframe: Optional[str] = None, weeks: Op
     """
     request = TrendbarRequest(pair=pair, timeframe=timeframe, weeks=weeks)
     return await get_trendbar(request)
+
+
+@app.post("/getTradeSignal")
+async def get_trade_signal(request: TradeSignalRequest):
+    """
+    Fetch trendbar data and run strategy analysis to get trade signal
+    
+    Args:
+        request: TradeSignalRequest with pair, optional timeframe and weeks
+    
+    Returns:
+        JSON response with trendbar data AND strategy signal/decision
+    """
+    if trader_instance is None:
+        raise HTTPException(status_code=503, detail="Trader not initialized")
+    
+    # Validate pair
+    if request.pair not in FOREX_SYMBOLS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid pair. Available pairs: {list(FOREX_SYMBOLS.keys())}"
+        )
+    
+    # Use default timeframe if not provided
+    timeframe = request.timeframe or PAIR_TIMEFRAMES.get(request.pair, "M30")
+    weeks = request.weeks or 6
+    
+    try:
+        logger.info(f"Getting trade signal for {request.pair}, timeframe: {timeframe}, weeks: {weeks}")
+        
+        # Fetch trendbars and run strategy analysis
+        result = await trader_instance.get_trade_signal_async(
+            pair=request.pair,
+            timeframe=timeframe,
+            weeks=weeks
+        )
+        
+        return JSONResponse(content=result)
+        
+    except Exception as e:
+        logger.error(f"Error getting trade signal: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error getting trade signal: {str(e)}")
+
+
+@app.get("/getTradeSignal/{pair}")
+async def get_trade_signal_get(pair: str, timeframe: Optional[str] = None, weeks: Optional[int] = 6):
+    """
+    GET endpoint for fetching trade signal (trendbars + strategy analysis)
+    
+    Args:
+        pair: Forex pair (e.g., EUR/USD)
+        timeframe: Optional timeframe (defaults to pair's default)
+        weeks: Optional number of weeks (default: 6)
+    """
+    request = TradeSignalRequest(pair=pair, timeframe=timeframe, weeks=weeks)
+    return await get_trade_signal(request)
 
 
 @app.post("/news")

@@ -848,6 +848,76 @@ class SimpleTrader:
                 self._api_pending_orders[request_id]["error"] = str(error)
                 self._api_pending_orders[request_id]["event"].set()
 
+    async def get_trade_signal_async(self, pair: str, timeframe: str = "M30", weeks: int = 6) -> Dict[str, Any]:
+        """
+        Async method to fetch trendbars and run strategy analysis.
+        Returns trendbars data, strategy output/decision, and technical indicators.
+        
+        Args:
+            pair: Forex pair (e.g., "EUR/USD")
+            timeframe: Timeframe string (default: "M30")
+            weeks: Number of weeks of historical data (default: 6)
+        
+        Returns:
+            Dict containing:
+                - trendbars: DataFrame converted to records
+                - strategy_signal: Strategy analysis output (decision, entry_price, stop_loss, take_profit, etc.)
+                - indicators: Technical indicators snapshot (EMAs, RSI, ATR, trend_alignment, etc.)
+                - pair: The pair analyzed
+                - timeframe: The timeframe used
+                - count: Number of trendbars
+        """
+        # Wait for authentication
+        timeout_count = 0
+        while not self._authenticated and timeout_count < 30:
+            await asyncio.sleep(0.5)
+            timeout_count += 1
+        
+        if not self._authenticated:
+            raise Exception("Trader not authenticated yet")
+        
+        # Validate pair
+        if pair not in FOREX_SYMBOLS:
+            raise ValueError(f"Invalid pair: {pair}")
+        
+        # Fetch trendbars
+        df = await self.fetch_trendbars_async(pair=pair, timeframe=timeframe, weeks=weeks)
+        
+        if df is None or df.empty:
+            return {
+                "pair": pair,
+                "timeframe": timeframe,
+                "weeks": weeks,
+                "count": 0,
+                "trendbars": [],
+                "strategy_signal": {
+                    "decision": "NO TRADE",
+                    "reason": "No trendbar data available"
+                },
+                "indicators": {}
+            }
+        
+        # Run strategy analysis
+        strategy_signal = self.analyze_strategy(pair, df)
+        
+        # Compute technical indicators snapshot
+        indicators = self.compute_indicators_snapshot(df)
+        
+        # Convert DataFrame to records for JSON serialization
+        df_copy = df.copy()
+        df_copy['timestamp'] = df_copy['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S UTC')
+        trendbars_records = df_copy.to_dict('records')
+        
+        return {
+            "pair": pair,
+            "timeframe": timeframe,
+            "weeks": weeks,
+            "count": len(trendbars_records),
+            "trendbars": trendbars_records,
+            "strategy_signal": strategy_signal,
+            "indicators": indicators
+        }
+    
     def analyze_strategy(self, pair: str, df: pd.DataFrame) -> Dict[str, Any]:
         strat = self.strategies.get(pair)
         if not strat or df is None or df.empty:

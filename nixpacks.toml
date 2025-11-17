@@ -6,14 +6,14 @@ nixPkgs = ["python310", "chromium", "chromedriver"]
 
 [phases.install]
 cmds = [
-  "python -m ensurepip --upgrade",
-  "python -m pip install --upgrade pip",
-  "python -m pip install -r requirements.txt"
+  "python -m venv /opt/venv",
+  "/opt/venv/bin/pip install --upgrade pip",
+  "/opt/venv/bin/pip install -r requirements.txt"
 ]
 
 [phases.build]
 cmds = []
 
 [start]
-cmd = "uvicorn main:app --host 0.0.0.0 --port $PORT"
+cmd = "/opt/venv/bin/uvicorn main:app --host 0.0.0.0 --port $PORT"
 

@@ -861,7 +861,15 @@ class SimpleTrader:
         Returns:
             Dict containing:
                 - trendbars: DataFrame converted to records
-                - strategy_signal: Strategy analysis output (decision, entry_price, stop_loss, take_profit, etc.)
+                - strategy_signal: Enhanced strategy analysis output with:
+                    - decision: BUY/SELL/NO TRADE
+                    - entry_price: Entry price for the trade
+                    - stop_loss: Stop loss price
+                    - take_profit: Take profit price
+                    - risk_pips: Risk in pips (calculated)
+                    - reward_pips: Reward in pips (calculated)
+                    - risk_reward_ratio: R:R ratio (calculated)
+                    - distance_to_entry_pips: Distance from current price to entry (calculated)
                 - indicators: Technical indicators snapshot (EMAs, RSI, ATR, trend_alignment, etc.)
                 - pair: The pair analyzed
                 - timeframe: The timeframe used
@@ -903,6 +911,32 @@ class SimpleTrader:
         # Compute technical indicators snapshot
         indicators = self.compute_indicators_snapshot(df)
         
+        # Enhance strategy signal with risk metrics
+        enhanced_signal = strategy_signal.copy()
+        entry = strategy_signal.get("entry_price")
+        sl = strategy_signal.get("stop_loss")
+        tp = strategy_signal.get("take_profit")
+        current_price = indicators.get("current_price", entry)
+        
+        if entry and sl and tp:
+            # Calculate risk metrics
+            if enhanced_signal.get("decision") == "BUY":
+                risk_pips = abs(entry - sl)
+                reward_pips = abs(tp - entry)
+            elif enhanced_signal.get("decision") == "SELL":
+                risk_pips = abs(sl - entry)
+                reward_pips = abs(entry - tp)
+            else:
+                risk_pips = None
+                reward_pips = None
+            
+            if risk_pips is not None and reward_pips is not None:
+                enhanced_signal["risk_pips"] = round(risk_pips, 5)
+                enhanced_signal["reward_pips"] = round(reward_pips, 5)
+                if risk_pips > 0:
+                    enhanced_signal["risk_reward_ratio"] = round(reward_pips / risk_pips, 2)
+                enhanced_signal["distance_to_entry_pips"] = round(abs(current_price - entry), 5) if current_price else 0
+        
         # Convert DataFrame to records for JSON serialization
         df_copy = df.copy()
         df_copy['timestamp'] = df_copy['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -914,7 +948,7 @@ class SimpleTrader:
             "weeks": weeks,
             "count": len(trendbars_records),
             "trendbars": trendbars_records,
-            "strategy_signal": strategy_signal,
+            "strategy_signal": enhanced_signal,
             "indicators": indicators
         }
     

@@ -6,7 +6,9 @@ FastAPI server for cTrader trendbar data
 import os
 import logging
 import datetime
+import asyncio
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -247,9 +249,9 @@ async def get_news(request: NewsRequest):
         raise HTTPException(status_code=503, detail="Trader not initialized")
     
     try:
-        # Force refresh if requested
-        if request.refresh:
-            logger.info("Refreshing news cache...")
+        # Scrape news if cache is empty or if refresh is requested
+        if request.refresh or not trader_instance.all_news_events:
+            logger.info("Scraping ForexFactory news...")
             trader_instance.scrape_all_news()
         
         # If pair is specified, filter for that pair
@@ -483,6 +485,66 @@ async def cancel_order_delete(order_id: int):
     """
     request = CancelOrderRequest(order_id=order_id)
     return await cancel_order(request)
+
+
+@app.get("/account-data")
+async def get_account_data(account_id: Optional[int] = None):
+    """
+    Fetch all account data from cTrader OpenAPI:
+    - Closed deals (historical trades)
+    - Open positions
+    - Account statistics
+    
+    Args:
+        account_id: Optional account ID. If not provided, uses CTRADER_ACCOUNT_ID from env
+    
+    Returns:
+        JSON response with all account data including:
+        - summary_stats: Overall statistics and per-pair summaries
+        - trades_by_symbol: All closed trades grouped by symbol
+        - account_info: Account balance, equity, margin, etc.
+        - open_positions: Current open positions
+    """
+    if trader_instance is None:
+        raise HTTPException(status_code=503, detail="Trader not initialized")
+    
+    try:
+        # Determine account ID
+        if account_id is None:
+            account_id_str = os.getenv("CTRADER_ACCOUNT_ID")
+            if not account_id_str:
+                raise HTTPException(
+                    status_code=400,
+                    detail="account_id parameter required or CTRADER_ACCOUNT_ID must be set in environment"
+                )
+            account_id = int(account_id_str)
+        
+        logger.info(f"Fetching account data for account ID: {account_id}")
+        
+        # Use SimpleTrader's integrated method (much easier - uses existing reactor!)
+        result_data = await trader_instance.fetch_account_data_async(account_id=account_id)
+        
+        logger.info(f"Successfully fetched data for account {account_id}: {result_data['summary_stats']['total_trades']} trades")
+        
+        return JSONResponse(content=result_data)
+        
+    except ValueError as e:
+        logger.error(f"Validation error fetching account data: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error fetching account data: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error fetching account data: {str(e)}")
+
+
+@app.get("/account-data/{account_id}")
+async def get_account_data_by_id(account_id: int):
+    """
+    GET endpoint for fetching account data by account ID
+    
+    Args:
+        account_id: The account ID to fetch data for
+    """
+    return await get_account_data(account_id=account_id)
 
 
 if __name__ == "__main__":

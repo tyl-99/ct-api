@@ -45,6 +45,7 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAGetTrendbarsReq
 from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAApplicationAuthReq, ProtoOAAccountAuthReq
 from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOANewOrderReq
 from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOACancelOrderReq
+from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOADealListReq, ProtoOAReconcileReq, ProtoOATraderReq, ProtoOAOrderDetailsReq
 from ctrader_open_api.messages.OpenApiCommonMessages_pb2 import *
 from ctrader_open_api.messages.OpenApiModelMessages_pb2 import *
 from twisted.internet import reactor
@@ -142,7 +143,7 @@ class SimpleTrader:
         self.pair_index: int = 0
         self.trendbar: pd.DataFrame = pd.DataFrame()
         
-        # News cache - scraped once at startup
+        # News cache - scraped on-demand when requested via API endpoints
         self.all_news_events: List[Dict[str, Any]] = []
         
         # API async support
@@ -154,6 +155,10 @@ class SimpleTrader:
         # Order execution tracking
         self._api_pending_orders: Dict[str, Dict[str, Any]] = {}  # request_id -> {event, result, error}
         self._api_order_counter: int = 0
+        
+        # Account data fetching support
+        self._account_data_pending: Dict[str, Any] = {}  # Stores pending account data requests
+        self._account_data_lock = threading.Lock()
 
     def connect(self, api_mode: bool = False) -> None:
         """Connect to cTrader. If api_mode=True, reactor runs indefinitely for API requests."""
@@ -198,10 +203,8 @@ class SimpleTrader:
         logger.info("User authenticated")
         self._authenticated = True
         # For API mode, we don't auto-process pairs - just keep reactor running
-        # Only scrape news if we have pairs configured (for backward compatibility)
+        # News scraping is now done on-demand when requested via API endpoints
         if self.pairs:
-            logger.info("Scraping ForexFactory news...")
-            self.scrape_all_news()
             # Only auto-process if running in CLI mode (not API mode)
             # API mode will be detected by checking if reactor is already running
             if not hasattr(self, '_api_mode') or not self._api_mode:
@@ -1534,6 +1537,495 @@ class SimpleTrader:
         else:
             logger.info("All pairs processed; stopping")
             reactor.stop()
+    
+    # Symbol ID to name mapping for account data
+    ID_TO_SYMBOL = {v: k for k, v in FOREX_SYMBOLS.items()}
+    
+    async def fetch_account_data_async(self, account_id: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Fetch all account data: closed deals, open positions, and account info.
+        Uses the existing reactor and client connection.
+        
+        Args:
+            account_id: Optional account ID. If None, uses self.account_id
+        
+        Returns:
+            Dictionary with summary_stats, trades_by_symbol, account_info, open_positions
+        """
+        if account_id is None:
+            account_id = self.account_id
+        
+        # Wait for authentication
+        timeout_count = 0
+        while not self._authenticated and timeout_count < 50:
+            await asyncio.sleep(0.1)
+            timeout_count += 1
+        
+        if not self._authenticated:
+            raise ValueError("Not authenticated to cTrader")
+        
+        # Create request tracking structure
+        request_id = f"account_data_{account_id}_{int(time.time() * 1000)}"
+        event = asyncio.Event()
+        loop = asyncio.get_event_loop()
+        
+        with self._account_data_lock:
+            self._account_data_pending[request_id] = {
+                'event': event,
+                'loop': loop,
+                'account_id': account_id,
+                'closed_deals': [],
+                'open_positions': [],
+                'account_info': {},
+                'pending_deal_orders': {},
+                'pending_requests': 0,
+                'data_ready': False,
+                'error': None
+            }
+        
+        data_state = self._account_data_pending[request_id]
+        
+        # Schedule data fetching on reactor thread
+        reactor.callFromThread(self._fetch_account_data_on_reactor, account_id, request_id)
+        
+        # Wait for data with timeout (60 seconds)
+        try:
+            await asyncio.wait_for(event.wait(), timeout=60.0)
+        except asyncio.TimeoutError:
+            with self._account_data_lock:
+                if request_id in self._account_data_pending:
+                    self._account_data_pending[request_id]['error'] = "Timeout waiting for account data"
+                    del self._account_data_pending[request_id]
+            raise ValueError("Timeout waiting for account data")
+        
+        # Get result
+        with self._account_data_lock:
+            if request_id not in self._account_data_pending:
+                raise ValueError("Account data request was cancelled or failed")
+            
+            if data_state['error']:
+                error = data_state['error']
+                del self._account_data_pending[request_id]
+                raise ValueError(error)
+            
+            # Process and return data
+            result = self._process_account_data(data_state)
+            del self._account_data_pending[request_id]
+            return result
+    
+    def _fetch_account_data_on_reactor(self, account_id: int, request_id: str):
+        """Fetch account data - called on reactor thread"""
+        data_state = self._account_data_pending.get(request_id)
+        if not data_state:
+            return
+        
+        # Fetch closed deals
+        self._fetch_closed_deals(account_id, request_id)
+        # Fetch open positions
+        self._fetch_open_positions(account_id, request_id)
+        # Fetch account info
+        self._fetch_account_info(account_id, request_id)
+    
+    def _fetch_closed_deals(self, account_id: int, request_id: str):
+        """Fetch closed deals"""
+        try:
+            start_date = datetime.datetime(2025, 7, 14, 9, 34, 39)
+            end_date = datetime.datetime.now()
+            
+            deal_req = ProtoOADealListReq()
+            deal_req.ctidTraderAccountId = account_id
+            deal_req.fromTimestamp = int(start_date.timestamp() * 1000)
+            deal_req.toTimestamp = int(end_date.timestamp() * 1000)
+            deal_req.maxRows = 1000
+            
+            data_state = self._account_data_pending.get(request_id)
+            if data_state:
+                data_state['pending_requests'] += 1
+            
+            deferred = self.client.send(deal_req)
+            deferred.addCallbacks(
+                lambda resp: self._on_deals_received(resp, request_id),
+                lambda failure: self._on_account_data_error(failure, request_id, "deals")
+            )
+        except Exception as e:
+            logger.error(f"Error fetching deals: {e}")
+            self._on_account_data_error(e, request_id, "deals")
+    
+    def _on_deals_received(self, response, request_id: str):
+        """Process received deals"""
+        try:
+            parsed = Protobuf.extract(response)
+            data_state = self._account_data_pending.get(request_id)
+            if not data_state:
+                return
+            
+            data_state['pending_requests'] -= 1
+            
+            if hasattr(parsed, 'deal') and parsed.deal:
+                for deal in parsed.deal:
+                    if (hasattr(deal, 'closePositionDetail') and 
+                        deal.closePositionDetail and 
+                        deal.closePositionDetail.grossProfit != 0):
+                        
+                        deal_time = datetime.datetime.utcfromtimestamp(deal.executionTimestamp / 1000)
+                        symbol_name = self.ID_TO_SYMBOL.get(deal.symbolId, "UNKNOWN")
+                        
+                        raw_volume = getattr(deal, 'volume', 0)
+                        raw_profit = deal.closePositionDetail.grossProfit
+                        raw_commission = getattr(deal.closePositionDetail, 'commission', 0)
+                        raw_swap = getattr(deal.closePositionDetail, 'swap', 0)
+                        raw_price = getattr(deal.closePositionDetail, 'entryPrice', 0) or getattr(deal, 'executionPrice', 0)
+                        raw_sl = getattr(deal.closePositionDetail, 'stopLoss', 0) or getattr(deal, 'stopLoss', 0)
+                        raw_tp = getattr(deal.closePositionDetail, 'takeProfit', 0) or getattr(deal, 'takeProfit', 0)
+                        raw_close_price = getattr(deal.closePositionDetail, 'closePrice', 0) or getattr(deal, 'closePrice', 0)
+                        
+                        lots = raw_volume / 100000000
+                        profit_usd = raw_profit / 100
+                        commission_usd = raw_commission / 100
+                        swap_usd = raw_swap / 100
+                        net_pnl = profit_usd + commission_usd + swap_usd
+                        
+                        actual_price = raw_price
+                        actual_sl = raw_sl if raw_sl else 0
+                        actual_tp = raw_tp if raw_tp else 0
+                        actual_close = raw_close_price if raw_close_price else actual_price
+                        
+                        pip_size = 0.01 if 'JPY' in symbol_name else 0.0001
+                        direction = 'BUY' if getattr(deal, 'tradeSide', 0) == ProtoOATradeSide.BUY else 'SELL'
+                        
+                        if actual_close > 0 and abs(actual_close - actual_price) > pip_size * 0.1:
+                            if direction == "BUY":
+                                pips = (actual_close - actual_price) / pip_size
+                            else:
+                                pips = (actual_price - actual_close) / pip_size
+                        else:
+                            pip_value_per_lot = 1.0
+                            if lots > 0:
+                                estimated_pips = profit_usd / (lots * pip_value_per_lot)
+                                if abs(estimated_pips) > 100:
+                                    estimated_pips = estimated_pips / 10
+                                if abs(estimated_pips) > 100:
+                                    estimated_pips = estimated_pips / 5
+                                pips = estimated_pips
+                            else:
+                                pips = 0
+                        
+                        if 'JPY' in symbol_name:
+                            entry_price = float(f"{actual_price:.3f}")
+                            close_price = float(f"{actual_close:.3f}")
+                            sl_formatted = float(f"{actual_sl:.3f}") if actual_sl else None
+                            tp_formatted = float(f"{actual_tp:.3f}") if actual_tp else None
+                        else:
+                            entry_price = float(f"{actual_price:.5f}")
+                            close_price = float(f"{actual_close:.5f}")
+                            sl_formatted = float(f"{actual_sl:.5f}") if actual_sl else None
+                            tp_formatted = float(f"{actual_tp:.5f}") if actual_tp else None
+                        
+                        trade_data = {
+                            'Trade ID': int(getattr(deal, 'dealId', 0)),
+                            'pair': symbol_name,
+                            'Entry DateTime': deal_time.isoformat(),
+                            'Buy/Sell': direction,
+                            'Entry Price': entry_price,
+                            'SL': sl_formatted if sl_formatted is not None else 'N/A',
+                            'TP': tp_formatted if tp_formatted is not None else 'N/A',
+                            'Close Price': close_price,
+                            'Pips': float(f"{pips:.1f}"),
+                            'Lots': float(f"{lots:.3f}"),
+                            'PnL': float(f"{net_pnl:.2f}"),
+                            'Win/Lose': 'WIN' if net_pnl > 0 else 'LOSE',
+                            'Commission': float(f"{commission_usd:.2f}"),
+                            'Swap': float(f"{swap_usd:.2f}")
+                        }
+                        
+                        data_state['closed_deals'].append(trade_data)
+            
+            self._check_account_data_completion(request_id)
+            
+        except Exception as e:
+            logger.error(f"Error processing deals: {e}")
+            data_state = self._account_data_pending.get(request_id)
+            if data_state:
+                data_state['pending_requests'] -= 1
+            self._on_account_data_error(e, request_id, "deals")
+    
+    def _fetch_open_positions(self, account_id: int, request_id: str):
+        """Fetch open positions"""
+        try:
+            positions_req = ProtoOAReconcileReq()
+            positions_req.ctidTraderAccountId = account_id
+            
+            data_state = self._account_data_pending.get(request_id)
+            if data_state:
+                data_state['pending_requests'] += 1
+            
+            deferred = self.client.send(positions_req)
+            deferred.addCallbacks(
+                lambda resp: self._on_positions_received(resp, request_id),
+                lambda failure: self._on_account_data_error(failure, request_id, "positions")
+            )
+        except Exception as e:
+            logger.error(f"Error fetching positions: {e}")
+            self._on_account_data_error(e, request_id, "positions")
+    
+    def _on_positions_received(self, response, request_id: str):
+        """Process received positions"""
+        try:
+            parsed = Protobuf.extract(response)
+            data_state = self._account_data_pending.get(request_id)
+            if not data_state:
+                return
+            
+            data_state['pending_requests'] -= 1
+            
+            if hasattr(parsed, 'position') and parsed.position:
+                for position in parsed.position:
+                    if not hasattr(position, 'symbolId'):
+                        continue
+                    
+                    symbol_name = self.ID_TO_SYMBOL.get(position.symbolId, "UNKNOWN")
+                    
+                    position_data = {
+                        'position_id': position.positionId,
+                        'symbol': symbol_name,
+                        'symbol_id': position.symbolId,
+                        'volume': position.volume,
+                        'direction': 'BUY' if position.tradeSide == ProtoOATradeSide.BUY else 'SELL',
+                        'entry_price': getattr(position, 'price', 0),
+                        'current_price': getattr(position, 'currentPrice', 0),
+                        'unrealized_pnl': getattr(position, 'unrealizedPnL', 0),
+                        'commission': getattr(position, 'usedMargin', 0)
+                    }
+                    
+                    data_state['open_positions'].append(position_data)
+            
+            self._check_account_data_completion(request_id)
+            
+        except Exception as e:
+            logger.error(f"Error processing positions: {e}")
+            data_state = self._account_data_pending.get(request_id)
+            if data_state:
+                data_state['pending_requests'] -= 1
+            self._on_account_data_error(e, request_id, "positions")
+    
+    def _fetch_account_info(self, account_id: int, request_id: str):
+        """Fetch account information"""
+        try:
+            trader_req = ProtoOATraderReq()
+            trader_req.ctidTraderAccountId = account_id
+            
+            data_state = self._account_data_pending.get(request_id)
+            if data_state:
+                data_state['pending_requests'] += 1
+            
+            deferred = self.client.send(trader_req)
+            deferred.addCallbacks(
+                lambda resp: self._on_account_info_received(resp, request_id, account_id),
+                lambda failure: self._on_account_data_error(failure, request_id, "account_info")
+            )
+        except Exception as e:
+            logger.error(f"Error fetching account info: {e}")
+            self._on_account_data_error(e, request_id, "account_info")
+    
+    def _on_account_info_received(self, response, request_id: str, account_id: int):
+        """Process account information"""
+        try:
+            parsed = Protobuf.extract(response)
+            data_state = self._account_data_pending.get(request_id)
+            if not data_state:
+                return
+            
+            data_state['pending_requests'] -= 1
+            
+            if hasattr(parsed, 'trader'):
+                trader = parsed.trader
+                data_state['account_info'] = {
+                    'account_id': account_id,
+                    'balance': round(getattr(trader, 'balance', 0) / 100, 2),
+                    'equity': round(getattr(trader, 'equity', 0) / 100, 2),
+                    'free_margin': round(getattr(trader, 'freeMargin', 0) / 100, 2),
+                    'margin': round(getattr(trader, 'margin', 0) / 100, 2),
+                    'margin_level': round(getattr(trader, 'marginLevel', 0) / 100, 2),
+                    'currency': 'USD'
+                }
+            
+            self._check_account_data_completion(request_id)
+            
+        except Exception as e:
+            logger.error(f"Error processing account info: {e}")
+            data_state = self._account_data_pending.get(request_id)
+            if data_state:
+                data_state['pending_requests'] -= 1
+            self._on_account_data_error(e, request_id, "account_info")
+    
+    def _fetch_trendbars_for_pairs(self, account_id: int, request_id: str):
+        """Fetch trendbars for all pairs"""
+        for symbol, symbol_id in FOREX_SYMBOLS.items():
+            self._fetch_trendbars(symbol, symbol_id, account_id, request_id)
+    
+    def _fetch_trendbars(self, symbol: str, symbol_id: int, account_id: int, request_id: str, period: str = "H1", count: int = 200):
+        """Fetch trendbars for a specific symbol"""
+        try:
+            now = datetime.datetime.now()
+            hours_back = count if period == "H1" else (count * 30 / 60 if period == "M30" else count * 4 if period == "H4" else count)
+            from_time = now - datetime.timedelta(hours=hours_back)
+            
+            trendbar_req = ProtoOAGetTrendbarsReq()
+            trendbar_req.ctidTraderAccountId = account_id
+            trendbar_req.symbolId = symbol_id
+            trendbar_req.period = getattr(ProtoOATrendbarPeriod, period, ProtoOATrendbarPeriod.H1)
+            trendbar_req.fromTimestamp = int(from_time.timestamp() * 1000)
+            trendbar_req.toTimestamp = int(datetime.datetime.now().timestamp() * 1000)
+            trendbar_req.count = count
+            
+            data_state = self._account_data_pending.get(request_id)
+            if data_state:
+                data_state['pending_requests'] += 1
+            
+            deferred = self.client.send(trendbar_req)
+            deferred.addCallbacks(
+                lambda resp, sym=symbol: self._on_trendbars_received_for_account_data(resp, sym, request_id),
+                lambda failure, sym=symbol: self._on_account_data_error(failure, request_id, f"trendbars_{sym}")
+            )
+        except Exception as e:
+            logger.error(f"Error fetching trendbars for {symbol}: {e}")
+            self._on_account_data_error(e, request_id, f"trendbars_{symbol}")
+    
+    def _on_trendbars_received_for_account_data(self, response, symbol: str, request_id: str):
+        """Process trendbars for account data"""
+        try:
+            parsed = Protobuf.extract(response)
+            data_state = self._account_data_pending.get(request_id)
+            if not data_state:
+                return
+            
+            data_state['pending_requests'] -= 1
+            
+            if hasattr(parsed, 'trendbar') and parsed.trendbar:
+                candles = []
+                for bar in parsed.trendbar:
+                    bar_time = datetime.datetime.utcfromtimestamp(bar.utcTimestampInMinutes * 60)
+                    raw_open = getattr(bar, 'open', 0)
+                    raw_high = getattr(bar, 'high', 0)
+                    raw_low = getattr(bar, 'low', 0)
+                    raw_close = getattr(bar, 'close', 0)
+                    
+                    candle_data = {
+                        'timestamp': bar_time.isoformat(),
+                        'open': float(raw_open) if raw_open else 0.0,
+                        'high': float(raw_high) if raw_high else 0.0,
+                        'low': float(raw_low) if raw_low else 0.0,
+                        'close': float(raw_close) if raw_close else 0.0,
+                        'volume': getattr(bar, 'volume', 0)
+                    }
+                    candles.append(candle_data)
+                
+                data_state['trendbars_data'][symbol] = candles
+            
+            self._check_account_data_completion(request_id)
+            
+        except Exception as e:
+            logger.error(f"Error processing trendbars for {symbol}: {e}")
+            data_state = self._account_data_pending.get(request_id)
+            if data_state:
+                data_state['pending_requests'] -= 1
+            self._on_account_data_error(e, request_id, f"trendbars_{symbol}")
+    
+    def _check_account_data_completion(self, request_id: str):
+        """Check if all account data requests are complete"""
+        data_state = self._account_data_pending.get(request_id)
+        if not data_state:
+            return
+        
+        if data_state['pending_requests'] <= 0:
+            data_state['data_ready'] = True
+            # Signal the async event
+            loop = data_state.get('loop')
+            if loop and not loop.is_closed():
+                loop.call_soon_threadsafe(data_state['event'].set)
+            else:
+                # Fallback: set event directly if we're in the same thread
+                try:
+                    data_state['event'].set()
+                except:
+                    pass
+    
+    def _on_account_data_error(self, failure, request_id: str, operation: str):
+        """Handle account data fetch errors"""
+        data_state = self._account_data_pending.get(request_id)
+        if not data_state:
+            return
+        
+        data_state['pending_requests'] -= 1
+        error_msg = str(failure) if not isinstance(failure, Exception) else str(failure)
+        logger.error(f"Error in {operation} for account data: {error_msg}")
+        
+        # Still check completion in case other requests succeed
+        self._check_account_data_completion(request_id)
+    
+    def _process_account_data(self, data_state: Dict[str, Any]) -> Dict[str, Any]:
+        """Process and format account data for return"""
+        closed_deals = data_state['closed_deals']
+        open_positions = data_state['open_positions']
+        account_info = data_state['account_info']
+        
+        # Group trades by symbol
+        trades_by_symbol = {}
+        summary_stats = {
+            'total_pairs': 0,
+            'total_trades': len(closed_deals),
+            'total_wins': 0,
+            'total_losses': 0,
+            'total_pnl': 0.0,
+            'pairs_summary': {},
+            'account_info': account_info,
+            'open_positions': open_positions,
+            'last_updated': datetime.datetime.now().isoformat()
+        }
+        
+        for deal in closed_deals:
+            symbol = deal['pair']
+            symbol_key = symbol.replace('/', '_')
+            
+            if symbol_key not in trades_by_symbol:
+                trades_by_symbol[symbol_key] = []
+            
+            trades_by_symbol[symbol_key].append(deal)
+        
+        # Calculate summary statistics
+        for symbol_key, trades in trades_by_symbol.items():
+            wins = sum(1 for t in trades if t['Win/Lose'] == 'WIN')
+            losses = len(trades) - wins
+            total_pnl = sum(t['PnL'] for t in trades)
+            
+            summary_stats['pairs_summary'][symbol_key] = {
+                'total_trades': len(trades),
+                'wins': wins,
+                'losses': losses,
+                'total_pnl': total_pnl,
+                'win_rate': (wins / len(trades) * 100) if trades else 0.0,
+                'avg_pnl': (total_pnl / len(trades)) if trades else 0.0,
+                'fibonacci_accuracy': 0.0
+            }
+            
+            summary_stats['total_wins'] += wins
+            summary_stats['total_losses'] += losses
+            summary_stats['total_pnl'] += total_pnl
+        
+        summary_stats['total_pairs'] = len(trades_by_symbol)
+        if summary_stats['total_trades'] > 0:
+            summary_stats['overall_win_rate'] = (summary_stats['total_wins'] / summary_stats['total_trades']) * 100
+            summary_stats['avg_pnl'] = summary_stats['total_pnl'] / summary_stats['total_trades']
+        else:
+            summary_stats['overall_win_rate'] = 0.0
+            summary_stats['avg_pnl'] = 0.0
+        
+        return {
+            'summary_stats': summary_stats,
+            'trades_by_symbol': trades_by_symbol,
+            'account_id': data_state['account_id'],
+            'timestamp': datetime.datetime.now().isoformat()
+        }
 
 
 if __name__ == "__main__":

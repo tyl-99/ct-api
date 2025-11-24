@@ -130,6 +130,21 @@ class SimpleTrader:
         self.pushover_app_token = os.getenv("PUSHOVER_APP_TOKEN")
         self.pushover_user_key = os.getenv("PUSHOVER_USER_KEY")
 
+        # Risk management - load risk amounts per pair from .env
+        self.risk_amounts = {}
+        default_risk = float(os.getenv("RISK_DEFAULT", "50"))  # Default risk = 50 USD
+        for pair in FOREX_SYMBOLS.keys():
+            # Format: RISK_EUR_USD=50, RISK_GBP_USD=75, etc.
+            env_key = f"RISK_{pair.replace('/', '_')}"
+            risk_value = os.getenv(env_key)
+            if risk_value:
+                try:
+                    self.risk_amounts[pair] = float(risk_value)
+                except ValueError:
+                    self.risk_amounts[pair] = default_risk
+            else:
+                self.risk_amounts[pair] = default_risk
+
         # Testing flags
         self.force_signal: Optional[str] = None  # BUY/SELL
         self.force_entry: Optional[float] = None
@@ -903,7 +918,10 @@ class SimpleTrader:
                 "trendbars": [],
                 "strategy_signal": {
                     "decision": "NO TRADE",
-                    "reason": "No trendbar data available"
+                    "reason": "No trendbar data available",
+                    "stop_loss": 0,
+                    "take_profit": 0,
+                    "volume": 0
                 },
                 "indicators": {}
             }
@@ -921,24 +939,49 @@ class SimpleTrader:
         tp = strategy_signal.get("take_profit")
         current_price = indicators.get("current_price", entry)
         
-        if entry and sl and tp:
-            # Calculate risk metrics
-            if enhanced_signal.get("decision") == "BUY":
-                risk_pips = abs(entry - sl)
-                reward_pips = abs(tp - entry)
-            elif enhanced_signal.get("decision") == "SELL":
-                risk_pips = abs(sl - entry)
-                reward_pips = abs(entry - tp)
-            else:
-                risk_pips = None
-                reward_pips = None
+        # Check if decision is NO TRADE
+        decision = enhanced_signal.get("decision") or enhanced_signal.get("action")
+        if decision in (None, "NO TRADE", "HOLD", "NONE"):
+            # Ensure NO TRADE responses always have stop_loss=0, take_profit=0, volume=0
+            enhanced_signal["stop_loss"] = 0
+            enhanced_signal["take_profit"] = 0
+            enhanced_signal["volume"] = 0
+            enhanced_signal["entry_price"] = enhanced_signal.get("entry_price", 0)
+        elif entry and sl and tp:
+            # Calculate risk metrics for valid trades
+            decision_str = enhanced_signal.get("decision")
+            pip_size = 0.01 if 'JPY' in pair else 0.0001
             
-            if risk_pips is not None and reward_pips is not None:
-                enhanced_signal["risk_pips"] = round(risk_pips, 5)
-                enhanced_signal["reward_pips"] = round(reward_pips, 5)
+            if decision_str == "BUY":
+                risk_price_diff = abs(entry - sl)
+                reward_price_diff = abs(tp - entry)
+            elif decision_str == "SELL":
+                risk_price_diff = abs(sl - entry)
+                reward_price_diff = abs(entry - tp)
+            else:
+                risk_price_diff = None
+                reward_price_diff = None
+            
+            if risk_price_diff is not None and reward_price_diff is not None:
+                # Convert price differences to pips
+                risk_pips = risk_price_diff / pip_size
+                reward_pips = reward_price_diff / pip_size
+                
+                enhanced_signal["risk_pips"] = round(risk_pips, 2)
+                enhanced_signal["reward_pips"] = round(reward_pips, 2)
                 if risk_pips > 0:
                     enhanced_signal["risk_reward_ratio"] = round(reward_pips / risk_pips, 2)
-                enhanced_signal["distance_to_entry_pips"] = round(abs(current_price - entry), 5) if current_price else 0
+                enhanced_signal["distance_to_entry_pips"] = round(abs(current_price - entry) / pip_size, 2) if current_price else 0
+            
+            # Calculate volume based on risk amount and stop loss distance
+            if decision_str in ("BUY", "SELL") and entry and sl:
+                calculated_volume = self.calculate_volume_from_risk(pair, entry, sl, decision_str)
+                enhanced_signal["volume"] = calculated_volume
+                enhanced_signal["risk_amount_usd"] = self.risk_amounts.get(pair, 50.0)
+            else:
+                # Ensure volume is set (default to 0 if not provided)
+                if "volume" not in enhanced_signal:
+                    enhanced_signal["volume"] = 0
         
         # Convert DataFrame to records for JSON serialization
         df_copy = df.copy()
@@ -954,6 +997,78 @@ class SimpleTrader:
             "strategy_signal": enhanced_signal,
             "indicators": indicators
         }
+    
+    def calculate_volume_from_risk(
+        self,
+        pair: str,
+        entry_price: float,
+        stop_loss: float,
+        decision: str,
+        price_map: dict
+    ) -> float:
+        """
+        Calculate lot size based on actual pip value per each pair.
+        price_map must contain:
+            - "EURUSD"
+            - "GBPUSD"
+            - "USDJPY"
+        """
+
+        # Risk per trade (USD)
+        risk_amount = self.risk_amounts.get(pair, 50.0)
+
+        # Pip size
+        pip_size = 0.01 if "JPY" in pair else 0.0001
+
+        # Stop loss distance in pips
+        if decision.upper() == "BUY":
+            sl_distance_pips = abs(entry_price - stop_loss) / pip_size
+        else:
+            sl_distance_pips = abs(stop_loss - entry_price) / pip_size
+
+        if sl_distance_pips <= 0:
+            return 0.0
+
+        # Lot size standard
+        lot_contract = 100000
+
+        # -------- PIP VALUE CALCULATION -------- #
+        pair_clean = pair.replace("/", "")
+
+        if pair_clean in ["EURUSD", "GBPUSD"]:
+            # USD-quoted majors → fixed $10 per pip per lot
+            pip_value = (pip_size * lot_contract)  # = $10
+
+        elif pair_clean == "USDJPY":
+            usd_jpy = price_map.get("USDJPY", entry_price)
+            pip_value = (pip_size * lot_contract) / usd_jpy
+
+        elif pair_clean == "EURGBP":
+            gbpusd = price_map.get("GBPUSD")
+            if gbpusd:
+                pip_value = (pip_size * lot_contract) / gbpusd
+            else:
+                pip_value = 7.50  # fallback approx
+
+        elif pair_clean in ["EURJPY", "GBPJPY"]:
+            usd_jpy = price_map.get("USDJPY")
+            if usd_jpy:
+                pip_value = (pip_size * lot_contract) / usd_jpy
+            else:
+                pip_value = 7.0  # fallback
+            
+        else:
+            # Unknown pair fallback
+            pip_value = 10.0
+
+        # Calculate volume
+        volume = risk_amount / (sl_distance_pips * pip_value)
+
+        # Round & ensure minimum 0.01
+        volume = max(round(volume, 2), 0.01)
+
+        return volume
+
     
     def analyze_strategy(self, pair: str, df: pd.DataFrame) -> Dict[str, Any]:
         strat = self.strategies.get(pair)

@@ -929,6 +929,14 @@ class SimpleTrader:
         # Run strategy analysis
         strategy_signal = self.analyze_strategy(pair, df)
         
+        # Safety check: ensure strategy_signal is not None
+        if strategy_signal is None:
+            strategy_signal = {"decision": "NO TRADE", "reason": "Strategy returned None"}
+        
+        # Ensure strategy_signal is a dict
+        if not isinstance(strategy_signal, dict):
+            strategy_signal = {"decision": "NO TRADE", "reason": f"Strategy returned invalid type: {type(strategy_signal)}"}
+        
         # Compute technical indicators snapshot
         indicators = self.compute_indicators_snapshot(df)
         

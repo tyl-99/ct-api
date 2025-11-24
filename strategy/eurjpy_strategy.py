@@ -377,6 +377,11 @@ class EURJPYStrategy:
             if self.profile_enabled:
                 self.prof['zones_ms'] += (time.perf_counter() - t_z) * 1000
             self.last_candle_index = current_candle_index
+        
+        # Check if zones were found after update
+        if not self.zones:
+            self.blocking_reasons_counts["No valid supply/demand zones found"] += 1
+            return {"decision": "NO TRADE", "reason": "No valid supply/demand zones found"}
 
     def _add_zone_incremental(self, zone_type: str, base_high: float, base_low: float, created_at_idx: int) -> None:
         new_range = (base_high, base_low)
@@ -435,10 +440,6 @@ class EURJPYStrategy:
                 if cutoff > 0:
                     self.zones = [z for z in self.zones if z.get('created_at', i) >= cutoff]
         self._zones_scanned_upto = upto_idx
-        
-        if not self.zones:
-            self.blocking_reasons_counts["No valid supply/demand zones found"] += 1
-            return {"decision": "NO TRADE", "reason": "No valid supply/demand zones found"}
 
         # EMA Filter enabled
         if self.ema_periods:

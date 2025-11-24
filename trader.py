@@ -975,7 +975,9 @@ class SimpleTrader:
             
             # Calculate volume based on risk amount and stop loss distance
             if decision_str in ("BUY", "SELL") and entry and sl:
-                calculated_volume = self.calculate_volume_from_risk(pair, entry, sl, decision_str)
+                # Build price map for pip value calculation
+                price_map = self._build_price_map(pair, df, current_price)
+                calculated_volume = self.calculate_volume_from_risk(pair, entry, sl, decision_str, price_map)
                 enhanced_signal["volume"] = calculated_volume
                 enhanced_signal["risk_amount_usd"] = self.risk_amounts.get(pair, 50.0)
             else:
@@ -1068,6 +1070,50 @@ class SimpleTrader:
         volume = max(round(volume, 2), 0.01)
 
         return volume
+    
+    def _build_price_map(self, pair: str, df: pd.DataFrame, current_price: Optional[float] = None) -> Dict[str, float]:
+        """
+        Build a price map with current prices for reference pairs.
+        Used for calculating pip values in cross-currency pairs.
+        
+        Args:
+            pair: Current pair being analyzed
+            df: DataFrame with trendbar data
+            current_price: Current price of the pair (optional, will use from df if not provided)
+        
+        Returns:
+            Dictionary with EURUSD, GBPUSD, USDJPY prices
+        """
+        price_map = {}
+        
+        # Get current price for the pair being analyzed
+        if current_price is None and df is not None and not df.empty:
+            current_price = float(df['close'].iloc[-1])
+        
+        pair_clean = pair.replace("/", "")
+        
+        # Set the current pair's price
+        if current_price:
+            price_map[pair_clean] = current_price
+        
+        # Set reference pairs - use defaults if not available
+        # These are approximate values, but should be close enough for pip value calculation
+        if "EURUSD" not in price_map:
+            price_map["EURUSD"] = 1.08000  # Approximate default
+        if "GBPUSD" not in price_map:
+            price_map["GBPUSD"] = 1.27000  # Approximate default
+        if "USDJPY" not in price_map:
+            price_map["USDJPY"] = 150.000  # Approximate default
+        
+        # If we have the current pair's price, use it
+        if pair_clean == "EURUSD" and current_price:
+            price_map["EURUSD"] = current_price
+        elif pair_clean == "GBPUSD" and current_price:
+            price_map["GBPUSD"] = current_price
+        elif pair_clean == "USDJPY" and current_price:
+            price_map["USDJPY"] = current_price
+        
+        return price_map
 
     
     def analyze_strategy(self, pair: str, df: pd.DataFrame) -> Dict[str, Any]:

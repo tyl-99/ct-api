@@ -433,7 +433,7 @@ class SimpleTrader:
         entry_price: float,
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
-        expiration_minutes: Optional[int] = 15
+        expiration_minutes: Optional[int] = None
     ) -> Dict[str, Any]:
         """
         Async method to execute LIMIT or STOP orders for API calls.
@@ -446,7 +446,7 @@ class SimpleTrader:
             entry_price: Entry price (limit price for LIMIT, stop price for STOP)
             stop_loss: Optional stop loss price
             take_profit: Optional take profit price
-            expiration_minutes: Optional expiration in minutes (default: 15)
+            expiration_minutes: Optional expiration in minutes (default: None, no expiration)
         
         Returns:
             Dict with order result

@@ -190,10 +190,18 @@ class SimpleTrader:
 
     def connected(self, client):
         logger.info("Connected to cTrader")
+        self._authenticated = False  # Reset on new connection
         self.authenticate_app()
 
     def disconnected(self, client, reason):
-        logger.info("Disconnected: %s", reason)
+        logger.warning("Disconnected from cTrader: %s", reason)
+        self._authenticated = False
+        # Clear any pending requests that might be waiting
+        with self._api_lock:
+            for request_id, pending in list(self._api_pending_requests.items()):
+                if not pending["event"].is_set():
+                    pending["error"] = f"Connection lost: {reason}"
+                    pending["event"].set()
 
     def on_message(self, client, message):
         pass
@@ -265,7 +273,17 @@ class SimpleTrader:
             timeout_count += 1
         
         if not self._authenticated:
-            raise Exception("Trader not authenticated yet")
+            raise Exception("Trader not authenticated yet. Please wait for connection to establish.")
+        
+        # Check if client is connected (with fallback for older client versions)
+        is_connected = True
+        if hasattr(self.client, 'isConnected'):
+            is_connected = self.client.isConnected()
+        elif hasattr(self.client, '_connected'):
+            is_connected = self.client._connected
+        
+        if not is_connected:
+            raise Exception("cTrader client is not connected. Connection may have been lost. Please check the connection status.")
         
         symbol_id = FOREX_SYMBOLS.get(pair)
         if not symbol_id:
@@ -315,11 +333,14 @@ class SimpleTrader:
             try:
                 await asyncio.wait_for(
                     loop.run_in_executor(None, event.wait),
-                    timeout=30.0
+                    timeout=60.0  # Increased timeout to 60 seconds
                 )
             except asyncio.TimeoutError:
-                logger.error(f"Timeout waiting for trendbars for {pair}")
-                pending["error"] = "Timeout waiting for response"
+                logger.error(f"Timeout waiting for trendbars for {pair} (asyncio timeout after 60s)")
+                # Mark as timeout error
+                pending["error"] = "Timeout waiting for response from cTrader server (60s timeout)"
+                # Make sure event is set so we don't hang
+                event.set()
             
             # Get result
             result = pending["df"]
@@ -384,10 +405,23 @@ class SimpleTrader:
     
     def _on_trendbars_error_api(self, request_id: str, error):
         """Error callback for async API trendbar requests"""
-        logger.error(f"API trendbar request error: {error}")
+        # Extract error message more carefully
+        error_msg = str(error)
+        if hasattr(error, 'value'):
+            error_msg = str(error.value)
+        elif hasattr(error, 'getErrorMessage'):
+            error_msg = error.getErrorMessage()
+        
+        # Check for timeout/cancellation errors
+        if 'Deferred' in error_msg or 'timeout' in error_msg.lower() or 'cancelled' in error_msg.lower():
+            error_msg = f"Request timed out or was cancelled: {error_msg}. Connection may be unstable."
+            logger.error(f"API trendbar request timeout/cancellation for {request_id}: {error_msg}")
+        else:
+            logger.error(f"API trendbar request error for {request_id}: {error_msg}")
+        
         with self._api_lock:
             if request_id in self._api_pending_requests:
-                self._api_pending_requests[request_id]["error"] = str(error)
+                self._api_pending_requests[request_id]["error"] = error_msg
                 self._api_pending_requests[request_id]["event"].set()
     
     async def execute_order_async(
@@ -900,14 +934,44 @@ class SimpleTrader:
             timeout_count += 1
         
         if not self._authenticated:
-            raise Exception("Trader not authenticated yet")
+            raise Exception("Trader not authenticated yet. Please wait for connection to establish.")
+        
+        # Check if client is connected (with fallback for older client versions)
+        is_connected = True
+        if hasattr(self.client, 'isConnected'):
+            is_connected = self.client.isConnected()
+        elif hasattr(self.client, '_connected'):
+            is_connected = self.client._connected
+        
+        if not is_connected:
+            raise Exception("cTrader client is not connected. Connection may have been lost. Please check the connection status.")
         
         # Validate pair
         if pair not in FOREX_SYMBOLS:
             raise ValueError(f"Invalid pair: {pair}")
         
-        # Fetch trendbars
-        df = await self.fetch_trendbars_async(pair=pair, timeframe=timeframe, weeks=weeks)
+        # Fetch trendbars with retry logic
+        max_retries = 2
+        retry_count = 0
+        df = None
+        
+        while retry_count <= max_retries:
+            try:
+                df = await self.fetch_trendbars_async(pair=pair, timeframe=timeframe, weeks=weeks)
+                break  # Success, exit retry loop
+            except Exception as e:
+                error_msg = str(e)
+                if 'timeout' in error_msg.lower() or 'cancelled' in error_msg.lower() or 'Deferred' in error_msg:
+                    retry_count += 1
+                    if retry_count <= max_retries:
+                        logger.warning(f"Retry {retry_count}/{max_retries} for {pair} after timeout error")
+                        await asyncio.sleep(1.0)  # Wait before retry
+                        continue
+                    else:
+                        raise Exception(f"Failed to fetch trendbars after {max_retries} retries: {error_msg}")
+                else:
+                    # Non-timeout error, don't retry
+                    raise
         
         if df is None or df.empty:
             return {
@@ -1593,8 +1657,21 @@ class SimpleTrader:
         self.connect()
 
     def on_error(self, failure):
-        logger.error("API error: %s", failure)
-        self.move_next_pair()
+        error_msg = str(failure)
+        if hasattr(failure, 'value'):
+            error_msg = str(failure.value)
+        elif hasattr(failure, 'getErrorMessage'):
+            error_msg = failure.getErrorMessage()
+        
+        logger.error("API error: %s", error_msg)
+        
+        # If this is a connection error, mark as not authenticated
+        if 'connection' in error_msg.lower() or 'disconnect' in error_msg.lower():
+            self._authenticated = False
+        
+        # Only call move_next_pair if we're in CLI mode (not API mode)
+        if not hasattr(self, '_api_mode') or not self._api_mode:
+            self.move_next_pair()
 
     def _on_trendbars_response(self, pair: str, response):
         try:

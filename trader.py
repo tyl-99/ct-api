@@ -278,7 +278,11 @@ class SimpleTrader:
         # Check if client is connected (with fallback for older client versions)
         is_connected = True
         if hasattr(self.client, 'isConnected'):
-            is_connected = self.client.isConnected()
+            # Check if isConnected is callable (method) or a property (boolean)
+            if callable(getattr(self.client, 'isConnected', None)):
+                is_connected = self.client.isConnected()
+            else:
+                is_connected = self.client.isConnected
         elif hasattr(self.client, '_connected'):
             is_connected = self.client._connected
         
@@ -939,7 +943,11 @@ class SimpleTrader:
         # Check if client is connected (with fallback for older client versions)
         is_connected = True
         if hasattr(self.client, 'isConnected'):
-            is_connected = self.client.isConnected()
+            # Check if isConnected is callable (method) or a property (boolean)
+            if callable(getattr(self.client, 'isConnected', None)):
+                is_connected = self.client.isConnected()
+            else:
+                is_connected = self.client.isConnected
         elif hasattr(self.client, '_connected'):
             is_connected = self.client._connected
         

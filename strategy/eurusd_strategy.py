@@ -41,7 +41,7 @@ class EURUSDSTRATEGY:  # backup created in eurusd_strategy.py.bak
                  enable_volume_filter: bool = False,
                  min_volume_factor: float = 1.2,
                  session_hours_utc: Optional[List[str]] = ("07:00-08:30", "10:30-11:00", "15:00-16:00"),
-                 enable_session_hours_filter: bool = True,
+                 enable_session_hours_filter: bool = False,
                  enable_news_sentiment_filter: bool = False
                  ):
         self.target_pair = target_pair

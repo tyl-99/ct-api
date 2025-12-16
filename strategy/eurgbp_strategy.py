@@ -41,7 +41,7 @@ class EURGBPStrategy:
                  enable_volume_filter: bool = False,
                  min_volume_factor: float = 1.2,
                  session_hours_utc: Optional[List[str]] = ("00:00-00:59", "02:00-02:59", "05:00-05:59", "07:00-12:59", "16:00-19:59", "22:00-22:59"),
-                 enable_session_hours_filter: bool = True, # Enabled with approved windows
+                 enable_session_hours_filter: bool = False, # Enabled with approved windows
                  enable_news_sentiment_filter: bool = False
                  ):
         self.target_pair = target_pair

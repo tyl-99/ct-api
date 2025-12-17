@@ -474,7 +474,7 @@ class GBPUSDStrategy:
                 }
                 
         self.blocking_reasons_counts["No entry signal found after all checks"] += 1
-        return {"decision": "NO TRADE"}
+        return {"decision": "NO TRADE", "reason": "No entry signal found after all checks"}
 
     def get_blocking_reasons_counts(self) -> Dict[str, int]:
         """Returns a dictionary of counts for each reason a trade was blocked."""

@@ -488,11 +488,11 @@ class GBPJPYStrategy:
                 }
                 
         self.blocking_reasons_counts["No entry signal found after all checks"] += 1
-        return {"decision": "NO TRADE"}
+        return {"decision": "NO TRADE", "reason": "No entry signal found after all checks"}
 
     def analyze_trade_signal(self, df: pd.DataFrame, pair: str) -> Dict[str, Any]:
         if df is None or len(df) == 0:
-            return {"decision": "NO TRADE"}
+            return {"decision": "NO TRADE", "reason": "No data available"}
         return self.analyze_trade_signal_at_index(df, len(df) - 1, pair)
 
     def get_blocking_reasons_counts(self) -> Dict[str, int]:

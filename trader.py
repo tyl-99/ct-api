@@ -21,6 +21,7 @@ Environment variables required:
 
 import os
 import sys
+import shutil
 import time
 import json
 import logging
@@ -1214,44 +1215,79 @@ class SimpleTrader:
         r.raise_for_status()
         return r.json()
 
+    def _resolve_chromium_binary(self) -> Optional[str]:
+        for env_key in ("GOOGLE_CHROME_BIN", "CHROMIUM_BIN"):
+            p = os.getenv(env_key)
+            if p and os.path.isfile(p):
+                return p
+        for name in ("chromium", "chromium-browser", "google-chrome-stable", "google-chrome"):
+            p = shutil.which(name)
+            if p:
+                return p
+        for candidate in (
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/google-chrome",
+        ):
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
+    def _resolve_chromedriver_binary(self) -> Optional[str]:
+        p = os.getenv("CHROMEDRIVER_PATH")
+        if p and os.path.isfile(p):
+            return p
+        p = shutil.which("chromedriver")
+        if p:
+            return p
+        if os.path.isfile("/usr/bin/chromedriver"):
+            return "/usr/bin/chromedriver"
+        return None
+
     def scrape_all_news(self) -> None:
         """Scrape ForexFactory calendar once at startup and cache all events"""
+        driver = None
         try:
             today_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
             
             # Initialize Selenium
             chrome_options = Options()
-            chrome_options.add_argument('--headless')
-            chrome_options.add_argument('--no-sandbox')
-            chrome_options.add_argument('--disable-dev-shm-usage')
-            chrome_options.add_argument('--disable-gpu')
-            chrome_options.add_argument('--window-size=1920,1080')
-            chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-            # Railway/deployment environment settings
-            chrome_options.add_argument('--disable-extensions')
-            chrome_options.add_argument('--disable-software-rasterizer')
-            
-            # Set Chrome binary location for Railway/Nixpacks
-            chrome_bin = os.getenv('GOOGLE_CHROME_BIN') or os.getenv('CHROMIUM_BIN') or '/nix/store/*/chromium-*/bin/chromium'
-            if chrome_bin and chrome_bin != '/nix/store/*/chromium-*/bin/chromium':
+            chrome_options.add_argument("--headless=new")
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-setuid-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--window-size=1920,1080")
+            chrome_options.add_argument(
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            )
+            chrome_options.add_argument("--disable-extensions")
+            chrome_options.add_argument("--disable-software-rasterizer")
+
+            chrome_bin = self._resolve_chromium_binary()
+            if chrome_bin:
                 chrome_options.binary_location = chrome_bin
-            
-            # Try webdriver-manager first (auto-downloads ChromeDriver), then fallback to system
-            try:
-                from webdriver_manager.chrome import ChromeDriverManager
-                from selenium.webdriver.chrome.service import Service
-                service = Service(ChromeDriverManager().install())
-                driver = webdriver.Chrome(service=service, options=chrome_options)
-            except Exception:
+
+            from selenium.webdriver.chrome.service import Service
+
+            chromedriver_path = self._resolve_chromedriver_binary()
+            # Railway/Nixpacks: use paired chromium + chromedriver from nix (webdriver-manager often mismatches)
+            if chromedriver_path:
                 try:
-                    # Fallback: try with system chromedriver
-                    from selenium.webdriver.chrome.service import Service
-                    chromedriver_path = os.getenv('CHROMEDRIVER_PATH') or '/usr/bin/chromedriver'
                     service = Service(executable_path=chromedriver_path)
                     driver = webdriver.Chrome(service=service, options=chrome_options)
-                except Exception:
-                    # Final fallback: let Selenium find it automatically
-                    driver = webdriver.Chrome(options=chrome_options)
+                except Exception as e:
+                    logger.warning(
+                        "System chromedriver failed (%s), falling back to webdriver-manager",
+                        e,
+                    )
+                    chromedriver_path = None
+            if driver is None:
+                from webdriver_manager.chrome import ChromeDriverManager
+
+                service = Service(ChromeDriverManager().install())
+                driver = webdriver.Chrome(service=service, options=chrome_options)
             driver.implicitly_wait(10)
             
             # Format date for ForexFactory
@@ -1263,12 +1299,26 @@ class SimpleTrader:
             logger.info(f"Loading ForexFactory: {url}")
             driver.get(url)
             
-            # Wait for calendar table
-            wait = WebDriverWait(driver, 20)
-            wait.until(EC.presence_of_element_located((By.CLASS_NAME, "calendar__table")))
-            
+            wait = WebDriverWait(driver, 25)
+            table_ready = False
+            for by, selector in (
+                (By.CLASS_NAME, "calendar__table"),
+                (By.CSS_SELECTOR, "table.calendar__table"),
+                (By.CSS_SELECTOR, "table.calendar"),
+            ):
+                try:
+                    wait.until(EC.presence_of_element_located((by, selector)))
+                    table_ready = True
+                    break
+                except Exception:
+                    continue
+            if not table_ready:
+                logger.warning("ForexFactory calendar table not found with known selectors")
+
             events = []
             rows = driver.find_elements(By.CLASS_NAME, "calendar__row")
+            if not rows:
+                rows = driver.find_elements(By.CSS_SELECTOR, "tr.calendar__row")
             
             for row in rows:
                 try:
@@ -1331,13 +1381,18 @@ class SimpleTrader:
                 except Exception:
                     continue
             
-            driver.quit()
             self.all_news_events = events
             logger.info(f"✅ Scraped {len(events)} total events from ForexFactory")
             
         except Exception as e:
             logger.error(f"Error scraping ForexFactory with Selenium: {e}")
             self.all_news_events = []
+        finally:
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
 
     def get_news_for_pair(self, pair: str) -> Dict[str, Any]:
         """Filter cached news events for a specific pair"""

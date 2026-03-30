@@ -180,12 +180,19 @@ class EURUSDSTRATEGY:  # backup created in eurusd_strategy.py.bak
                 
                 # Condition 1: Base candles must have small ranges
                 avg_base_range = base_candles['candle_range'].mean()
-                
+                if avg_base_range == 0:
+                    continue
+
                 # Condition 2: Find the explosive move candle after the base
                 impulse_candle = df.iloc[i]
 
                 # Condition 3: Explosive move must be much larger than base candles
                 if impulse_candle['candle_range'] > avg_base_range * self.move_min_ratio:
+                    # Validate impulse has strong body (not just wicks)
+                    impulse_body = abs(impulse_candle['close'] - impulse_candle['open'])
+                    if impulse_body < impulse_candle['candle_range'] * 0.5:
+                        continue
+
                     base_high = base_candles['high'].max()
                     base_low = base_candles['low'].min()
                     zone_width_pips = (base_high - base_low) / self.pip_size
@@ -233,6 +240,17 @@ class EURUSDSTRATEGY:  # backup created in eurusd_strategy.py.bak
                     unique_zones.append(zone)
                     seen_ranges.append((zone['price_high'], zone['price_low']))
             self.zones = unique_zones
+
+        # Invalidate zones that price has already passed through
+        for zone in self.zones:
+            for j in range(zone['created_at'] + 1, len(df)):
+                c = df['close'].iloc[j]
+                if zone['type'] == 'demand' and c < zone['price_low']:
+                    zone['is_fresh'] = False
+                    break
+                if zone['type'] == 'supply' and c > zone['price_high']:
+                    zone['is_fresh'] = False
+                    break
 
     def find_all_zones(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
         """
@@ -310,8 +328,10 @@ class EURUSDSTRATEGY:  # backup created in eurusd_strategy.py.bak
         sl = 0
         tp = 0
 
-        in_supply_zone = zone['type'] == 'supply' and zone['price_low'] <= current_price <= zone['price_high']
-        in_demand_zone = zone['type'] == 'demand' and zone['price_low'] <= current_price <= zone['price_high']
+        zone_width = zone['price_high'] - zone['price_low']
+        entry_band = zone_width * 0.3
+        in_supply_zone = zone['type'] == 'supply' and (zone['price_high'] - entry_band) <= current_price <= zone['price_high']
+        in_demand_zone = zone['type'] == 'demand' and zone['price_low'] <= current_price <= (zone['price_low'] + entry_band)
 
         if in_supply_zone:
             decision = "SELL"
@@ -435,8 +455,10 @@ class EURUSDSTRATEGY:  # backup created in eurusd_strategy.py.bak
                 continue
 
             # Check for entry
-            in_supply_zone = zone['type'] == 'supply' and current_price >= zone['price_low'] and current_price <= zone['price_high']
-            in_demand_zone = zone['type'] == 'demand' and current_price >= zone['price_low'] and current_price <= zone['price_high']
+            zone_width = zone['price_high'] - zone['price_low']
+            entry_band = zone_width * 0.3
+            in_supply_zone = zone['type'] == 'supply' and current_price >= (zone['price_high'] - entry_band) and current_price <= zone['price_high']
+            in_demand_zone = zone['type'] == 'demand' and current_price >= zone['price_low'] and current_price <= (zone['price_low'] + entry_band)
             
             sl = 0
             tp = 0

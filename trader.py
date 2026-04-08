@@ -167,6 +167,9 @@ class SimpleTrader:
         self._api_request_counter: int = 0
         self._api_lock = threading.Lock()
         self._authenticated: bool = False
+        self._auth_retry_count: int = 0
+        self._max_auth_retries: int = 10
+        self._connection_generation: int = 0  # Tracks connection identity to discard stale retries
         
         # Order execution tracking
         self._api_pending_orders: Dict[str, Dict[str, Any]] = {}  # request_id -> {event, result, error}
@@ -192,6 +195,8 @@ class SimpleTrader:
     def connected(self, client):
         logger.info("Connected to cTrader")
         self._authenticated = False  # Reset on new connection
+        self._auth_retry_count = 0  # Reset retry counter on fresh connection
+        self._connection_generation += 1  # Invalidate any pending retries from old connection
         self.authenticate_app()
 
     def disconnected(self, client, reason):
@@ -207,25 +212,38 @@ class SimpleTrader:
     def on_message(self, client, message):
         pass
 
-    def authenticate_app(self):
+    def authenticate_app(self, _generation=None):
+        # If called from a retry, check the generation is still current
+        if _generation is not None and _generation != self._connection_generation:
+            return  # Connection changed since this retry was scheduled
+        if self._authenticated:
+            return  # Already authenticated
         req = ProtoOAApplicationAuthReq()
         req.clientId = self.client_id
         req.clientSecret = self.client_secret
-        d = self.client.send(req)
-        d.addCallbacks(self.on_app_auth_success, self.on_error)
+        gen = self._connection_generation
+        d = self.client.send(req, responseTimeoutInSeconds=15)
+        d.addCallbacks(lambda resp: self.on_app_auth_success(resp, gen),
+                        lambda fail: self._on_auth_error(fail, gen))
 
-    def on_app_auth_success(self, response):
+    def on_app_auth_success(self, response, generation):
+        if generation != self._connection_generation:
+            return  # Stale response from old connection
         access = os.getenv("CTRADER_ACCESS_TOKEN") or ""
         req = ProtoOAAccountAuthReq()
         req.ctidTraderAccountId = self.account_id
         if access:
             req.accessToken = access
-        d = self.client.send(req)
-        d.addCallbacks(self.on_user_auth_success, self.on_error)
+        d = self.client.send(req, responseTimeoutInSeconds=15)
+        d.addCallbacks(lambda resp: self.on_user_auth_success(resp, generation),
+                        lambda fail: self._on_auth_error(fail, generation))
 
-    def on_user_auth_success(self, response):
+    def on_user_auth_success(self, response, generation):
+        if generation != self._connection_generation:
+            return  # Stale response from old connection
         logger.info("User authenticated")
         self._authenticated = True
+        self._auth_retry_count = 0  # Reset on success
         # For API mode, we don't auto-process pairs - just keep reactor running
         # News scraping is now done on-demand when requested via API endpoints
         if self.pairs:
@@ -236,6 +254,19 @@ class SimpleTrader:
                 self.process_current_pair()
         else:
             logger.info("No pairs configured; running in API-only mode")
+
+    def _on_auth_error(self, failure, generation):
+        if generation != self._connection_generation:
+            return  # Stale error from old connection
+        error_msg = str(failure.value) if hasattr(failure, 'value') else str(failure)
+        self._auth_retry_count += 1
+        if self._auth_retry_count <= self._max_auth_retries:
+            delay = min(2 ** self._auth_retry_count, 30)  # Exponential backoff, max 30s
+            logger.warning("Authentication failed (%s), retrying in %ds (attempt %d/%d)",
+                           error_msg, delay, self._auth_retry_count, self._max_auth_retries)
+            reactor.callLater(delay, self.authenticate_app, generation)
+        else:
+            logger.error("Authentication failed after %d retries: %s", self._max_auth_retries, error_msg)
 
     def _period_to_proto(self, tf: str):
         # Mirror ctrader.py usage: use enum Value lookup by string name

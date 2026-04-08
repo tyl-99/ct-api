@@ -190,7 +190,7 @@ class GBPUSDStrategy:
                 if impulse_candle['candle_range'] > avg_base_range * self.move_min_ratio:
                     # Validate impulse has strong body (not just wicks)
                     impulse_body = abs(impulse_candle['close'] - impulse_candle['open'])
-                    if impulse_body < impulse_candle['candle_range'] * 0.5:
+                    if impulse_body < impulse_candle['candle_range'] * 0.4:
                         continue
 
                     base_high = base_candles['high'].max()
@@ -329,7 +329,7 @@ class GBPUSDStrategy:
         tp = 0
 
         zone_width = zone['price_high'] - zone['price_low']
-        entry_band = zone_width * 0.3
+        entry_band = zone_width * 0.5
         in_supply_zone = zone['type'] == 'supply' and (zone['price_high'] - entry_band) <= current_price <= zone['price_high']
         in_demand_zone = zone['type'] == 'demand' and zone['price_low'] <= current_price <= (zone['price_low'] + entry_band)
 
@@ -458,7 +458,7 @@ class GBPUSDStrategy:
 
             # Check for entry
             zone_width = zone['price_high'] - zone['price_low']
-            entry_band = zone_width * 0.3
+            entry_band = zone_width * 0.5
             in_supply_zone = zone['type'] == 'supply' and current_price >= (zone['price_high'] - entry_band) and current_price <= zone['price_high']
             in_demand_zone = zone['type'] == 'demand' and current_price >= zone['price_low'] and current_price <= (zone['price_low'] + entry_band)
             

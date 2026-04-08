@@ -1320,22 +1320,42 @@ class SimpleTrader:
                 service = Service(ChromeDriverManager().install())
                 driver = webdriver.Chrome(service=service, options=chrome_options)
             driver.implicitly_wait(10)
-            
+
             # Format date for ForexFactory
             dt = datetime.datetime.strptime(today_str, "%Y-%m-%d")
             month_abbr = dt.strftime("%b").lower()
             ff_date = f"{month_abbr}{dt.day}.{dt.year}"
             url = f"https://www.forexfactory.com/calendar?day={ff_date}"
-            
+
             logger.info(f"Loading ForexFactory: {url}")
             driver.get(url)
-            
-            wait = WebDriverWait(driver, 25)
+
+            # Dismiss cookie consent popup if present
+            import time
+            time.sleep(3)
+            for consent_sel in (
+                "a.consent_popup__btn--accept",
+                "button.consent_popup__btn--accept",
+                "[class*='consent'] button",
+                "[class*='cookie'] button",
+                "button[title='Consent']",
+            ):
+                try:
+                    btns = driver.find_elements(By.CSS_SELECTOR, consent_sel)
+                    if btns:
+                        btns[0].click()
+                        time.sleep(1)
+                        break
+                except Exception:
+                    continue
+
+            wait = WebDriverWait(driver, 30)
             table_ready = False
             for by, selector in (
                 (By.CLASS_NAME, "calendar__table"),
                 (By.CSS_SELECTOR, "table.calendar__table"),
                 (By.CSS_SELECTOR, "table.calendar"),
+                (By.CSS_SELECTOR, "[class*='calendar'] table"),
             ):
                 try:
                     wait.until(EC.presence_of_element_located((by, selector)))
@@ -1345,56 +1365,85 @@ class SimpleTrader:
                     continue
             if not table_ready:
                 logger.warning("ForexFactory calendar table not found with known selectors")
+                # Log page source snippet for debugging
+                try:
+                    src = driver.page_source[:2000]
+                    logger.debug(f"Page source preview: {src}")
+                except Exception:
+                    pass
 
             events = []
-            rows = driver.find_elements(By.CLASS_NAME, "calendar__row")
+            # Try multiple row selectors
+            rows = []
+            for row_sel in (
+                "tr.calendar__row",
+                "tr[class*='calendar__row']",
+                ".calendar__row",
+                "tr[data-eventid]",
+            ):
+                rows = driver.find_elements(By.CSS_SELECTOR, row_sel)
+                if rows:
+                    logger.info(f"Found {len(rows)} rows with selector: {row_sel}")
+                    break
+
             if not rows:
-                rows = driver.find_elements(By.CSS_SELECTOR, "tr.calendar__row")
-            
+                logger.warning("No calendar rows found with any selector")
+
+            current_time = ""
             for row in rows:
                 try:
-                    # Get time
-                    time_cells = row.find_elements(By.CLASS_NAME, "calendar__time")
-                    if not time_cells:
-                        continue
-                    time_str = time_cells[0].text.strip()
-                    
+                    # Get time - carry forward from previous row if empty (FF groups by time)
+                    time_cells = row.find_elements(By.CSS_SELECTOR, "td.calendar__time, td[class*='time']")
+                    time_text = time_cells[0].text.strip() if time_cells else ""
+                    if time_text:
+                        current_time = time_text
+                    time_str = current_time
+
                     # Get currency
-                    currency_cells = row.find_elements(By.CLASS_NAME, "calendar__currency")
+                    currency_cells = row.find_elements(By.CSS_SELECTOR, "td.calendar__currency, td[class*='currency']")
                     currency = currency_cells[0].text.strip() if currency_cells else ""
-                    
+
                     # Get impact
                     impact = "low"
-                    impact_cells = row.find_elements(By.CLASS_NAME, "calendar__impact")
+                    impact_cells = row.find_elements(By.CSS_SELECTOR, "td.calendar__impact, td[class*='impact']")
                     if impact_cells:
                         impact_spans = impact_cells[0].find_elements(By.TAG_NAME, "span")
+                        if not impact_spans:
+                            impact_spans = impact_cells[0].find_elements(By.CSS_SELECTOR, "[class*='icon']")
                         if impact_spans:
-                            classes = impact_spans[0].get_attribute("class")
-                            if "icon--ff-impact-red" in classes:
+                            classes = impact_spans[0].get_attribute("class") or ""
+                            if "red" in classes or "high" in classes:
                                 impact = "high"
-                            elif "icon--ff-impact-ora" in classes or "icon--ff-impact-yel" in classes:
+                            elif "ora" in classes or "yel" in classes or "medium" in classes:
                                 impact = "medium"
-                    
+
                     # Get event title
-                    event_cells = row.find_elements(By.CLASS_NAME, "calendar__event")
+                    event_cells = row.find_elements(By.CSS_SELECTOR, "td.calendar__event, td[class*='event']")
                     if not event_cells:
                         continue
-                    title_spans = event_cells[0].find_elements(By.CLASS_NAME, "calendar__event-title")
-                    title = title_spans[0].text.strip() if title_spans else ""
-                    
+                    title_spans = event_cells[0].find_elements(By.CSS_SELECTOR, ".calendar__event-title, [class*='event-title'], span")
+                    title = ""
+                    for ts in title_spans:
+                        t = ts.text.strip()
+                        if t:
+                            title = t
+                            break
                     if not title:
+                        title = event_cells[0].text.strip()
+
+                    if not title or not currency:
                         continue
-                    
+
                     # Get values
-                    actual_cells = row.find_elements(By.CLASS_NAME, "calendar__actual")
+                    actual_cells = row.find_elements(By.CSS_SELECTOR, "td.calendar__actual, td[class*='actual']")
                     actual = actual_cells[0].text.strip() if actual_cells else None
-                    
-                    forecast_cells = row.find_elements(By.CLASS_NAME, "calendar__forecast")
+
+                    forecast_cells = row.find_elements(By.CSS_SELECTOR, "td.calendar__forecast, td[class*='forecast']")
                     forecast = forecast_cells[0].text.strip() if forecast_cells else None
-                    
-                    previous_cells = row.find_elements(By.CLASS_NAME, "calendar__previous")
+
+                    previous_cells = row.find_elements(By.CSS_SELECTOR, "td.calendar__previous, td[class*='previous']")
                     previous = previous_cells[0].text.strip() if previous_cells else None
-                    
+
                     event = {
                         "date": today_str,
                         "time": time_str,
@@ -1406,14 +1455,15 @@ class SimpleTrader:
                         "forecast": forecast if forecast else None,
                         "previous": previous if previous else None
                     }
-                    
+
                     events.append(event)
-                    
-                except Exception:
+
+                except Exception as row_err:
+                    logger.debug(f"Error parsing row: {row_err}")
                     continue
-            
+
             self.all_news_events = events
-            logger.info(f"✅ Scraped {len(events)} total events from ForexFactory")
+            logger.info(f"Scraped {len(events)} total events from ForexFactory")
             
         except Exception as e:
             logger.error(f"Error scraping ForexFactory with Selenium: {e}")

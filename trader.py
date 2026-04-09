@@ -293,44 +293,12 @@ class SimpleTrader:
         d.addCallbacks(lambda resp: self._on_trendbars_response(pair, resp), self.on_error)
         return pd.DataFrame()  # actual data handled async
     
-    async def fetch_trendbars_async(self, pair: str, timeframe: str = "M30", weeks: int = 6) -> pd.DataFrame:
-        """
-        Async method to fetch trendbars for API calls.
-        Returns DataFrame or None if error/timeout.
-        """
-        # Wait for authentication
-        timeout_count = 0
-        while not self._authenticated and timeout_count < 30:
-            await asyncio.sleep(0.5)
-            timeout_count += 1
-        
-        if not self._authenticated:
-            raise Exception("Trader not authenticated yet. Please wait for connection to establish.")
-        
-        # Check if client is connected (with fallback for older client versions)
-        is_connected = True
-        if hasattr(self.client, 'isConnected'):
-            # Check if isConnected is callable (method) or a property (boolean)
-            if callable(getattr(self.client, 'isConnected', None)):
-                is_connected = self.client.isConnected()
-            else:
-                is_connected = self.client.isConnected
-        elif hasattr(self.client, '_connected'):
-            is_connected = self.client._connected
-        
-        if not is_connected:
-            raise Exception("cTrader client is not connected. Connection may have been lost. Please check the connection status.")
-        
-        symbol_id = FOREX_SYMBOLS.get(pair)
-        if not symbol_id:
-            raise ValueError(f"Invalid pair: {pair}")
-        
-        # Generate unique request ID
-        # Use threading.Event since callback runs in different thread
+    async def _send_trendbar_request(self, pair: str, symbol_id: int, timeframe: str, weeks: int) -> pd.DataFrame:
+        """Send a single trendbar request and wait for the response."""
         import threading as th
         event = th.Event()
         loop = asyncio.get_event_loop()
-        
+
         with self._api_lock:
             self._api_request_counter += 1
             request_id = f"req_{self._api_request_counter}_{pair}_{time.time()}"
@@ -340,9 +308,8 @@ class SimpleTrader:
                 "error": None,
                 "loop": loop
             }
-        
+
         try:
-            # Create request
             req = ProtoOAGetTrendbarsReq()
             req.ctidTraderAccountId = self.account_id
             req.period = ProtoOATrendbarPeriod.Value(timeframe)
@@ -351,61 +318,116 @@ class SimpleTrader:
             since = now - datetime.timedelta(weeks=weeks)
             req.fromTimestamp = int(since.timestamp() * 1000)
             req.toTimestamp = int(now.timestamp() * 1000)
-            
-            # Send request - request_id is already captured in the lambda closures
+
             d = self.client.send(req)
             d.addCallbacks(
                 lambda resp: self._on_trendbars_response_api(request_id, pair, resp),
                 lambda err: self._on_trendbars_error_api(request_id, err)
             )
-            
-            # Wait for response (with timeout)
-            # Use threading.Event.wait() in a thread-safe way with asyncio
+
             pending = self._api_pending_requests[request_id]
             event = pending["event"]
-            
-            # Run the blocking wait in an executor
+
             loop = asyncio.get_event_loop()
             try:
                 await asyncio.wait_for(
                     loop.run_in_executor(None, event.wait),
-                    timeout=60.0  # Increased timeout to 60 seconds
+                    timeout=60.0
                 )
             except asyncio.TimeoutError:
                 logger.error(f"Timeout waiting for trendbars for {pair} (asyncio timeout after 60s)")
-                # Mark as timeout error
                 pending["error"] = "Timeout waiting for response from cTrader server (60s timeout)"
-                # Make sure event is set so we don't hang
                 event.set()
-            
-            # Get result
+
             result = pending["df"]
             error = pending["error"]
-            
-            # Cleanup
+
             with self._api_lock:
                 if request_id in self._api_pending_requests:
                     del self._api_pending_requests[request_id]
-            
+
             if error:
                 raise Exception(error)
-            
+
             return result
-            
+
         except Exception as e:
-            # Cleanup on error
             with self._api_lock:
                 if request_id in self._api_pending_requests:
                     del self._api_pending_requests[request_id]
             raise
+
+    async def _reauth_and_wait(self):
+        """Re-authenticate the cTrader session and wait for completion."""
+        logger.info("Re-authenticating cTrader session...")
+        self._authenticated = False
+        reactor.callFromThread(self.authenticate_app)
+        timeout_count = 0
+        while not self._authenticated and timeout_count < 30:
+            await asyncio.sleep(0.5)
+            timeout_count += 1
+        if not self._authenticated:
+            raise Exception("Re-authentication failed after 15s")
+        logger.info("Re-authentication successful")
+
+    async def fetch_trendbars_async(self, pair: str, timeframe: str = "M30", weeks: int = 6) -> pd.DataFrame:
+        """
+        Async method to fetch trendbars for API calls.
+        Returns DataFrame or None if error/timeout.
+        If empty data is returned, re-authenticates and retries once.
+        """
+        # Wait for authentication
+        timeout_count = 0
+        while not self._authenticated and timeout_count < 30:
+            await asyncio.sleep(0.5)
+            timeout_count += 1
+
+        if not self._authenticated:
+            raise Exception("Trader not authenticated yet. Please wait for connection to establish.")
+
+        # Check if client is connected (with fallback for older client versions)
+        is_connected = True
+        if hasattr(self.client, 'isConnected'):
+            if callable(getattr(self.client, 'isConnected', None)):
+                is_connected = self.client.isConnected()
+            else:
+                is_connected = self.client.isConnected
+        elif hasattr(self.client, '_connected'):
+            is_connected = self.client._connected
+
+        if not is_connected:
+            raise Exception("cTrader client is not connected. Connection may have been lost.")
+
+        symbol_id = FOREX_SYMBOLS.get(pair)
+        if not symbol_id:
+            raise ValueError(f"Invalid pair: {pair}")
+
+        # First attempt
+        result = await self._send_trendbar_request(pair, symbol_id, timeframe, weeks)
+
+        # If empty, re-authenticate and retry once (session may have gone stale)
+        if result is None or result.empty:
+            logger.warning(f"Empty trendbars for {pair}, re-authenticating and retrying...")
+            await self._reauth_and_wait()
+            result = await self._send_trendbar_request(pair, symbol_id, timeframe, weeks)
+
+        return result
     
     def _on_trendbars_response_api(self, request_id: str, pair: str, response):
         """Callback for async API trendbar requests"""
         try:
             parsed = Protobuf.extract(response)
+            resp_type = type(parsed).__name__
             trendbars = getattr(parsed, 'trendbar', None)
             if not trendbars:
-                logger.warning(f"No trendbars for {pair}")
+                # Log diagnostic info to understand WHY no data came back
+                error_code = getattr(parsed, 'errorCode', None)
+                description = getattr(parsed, 'description', None)
+                logger.warning(
+                    f"No trendbars for {pair} — responseType={resp_type}, "
+                    f"errorCode={error_code}, description={description}, "
+                    f"payloadType={response.payloadType}"
+                )
                 with self._api_lock:
                     if request_id in self._api_pending_requests:
                         self._api_pending_requests[request_id]["df"] = pd.DataFrame()

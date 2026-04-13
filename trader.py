@@ -43,7 +43,7 @@ from selenium.webdriver.chrome.options import Options
 
 from ctrader_open_api import Client, Protobuf, TcpProtocol, EndPoints
 from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAGetTrendbarsReq
-from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAApplicationAuthReq, ProtoOAAccountAuthReq
+from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOAApplicationAuthReq, ProtoOAAccountAuthReq, ProtoOARefreshTokenReq
 from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOANewOrderReq
 from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOACancelOrderReq
 from ctrader_open_api.messages.OpenApiMessages_pb2 import ProtoOADealListReq, ProtoOAReconcileReq, ProtoOATraderReq, ProtoOAOrderDetailsReq
@@ -170,7 +170,13 @@ class SimpleTrader:
         self._auth_retry_count: int = 0
         self._max_auth_retries: int = 10
         self._connection_generation: int = 0  # Tracks connection identity to discard stale retries
-        
+
+        # OAuth tokens — access token may be refreshed at runtime via refresh_token flow
+        self.access_token: str = os.getenv("CTRADER_ACCESS_TOKEN") or ""
+        self.refresh_token: str = os.getenv("CTRADER_REFRESH_TOKEN") or ""
+        self._refresh_lock = threading.Lock()
+        self._refresh_pending: Optional[Dict[str, Any]] = None  # {event, error}
+
         # Order execution tracking
         self._api_pending_orders: Dict[str, Dict[str, Any]] = {}  # request_id -> {event, result, error}
         self._api_order_counter: int = 0
@@ -229,11 +235,10 @@ class SimpleTrader:
     def on_app_auth_success(self, response, generation):
         if generation != self._connection_generation:
             return  # Stale response from old connection
-        access = os.getenv("CTRADER_ACCESS_TOKEN") or ""
         req = ProtoOAAccountAuthReq()
         req.ctidTraderAccountId = self.account_id
-        if access:
-            req.accessToken = access
+        if self.access_token:
+            req.accessToken = self.access_token
         d = self.client.send(req, responseTimeoutInSeconds=15)
         d.addCallbacks(lambda resp: self.on_user_auth_success(resp, generation),
                         lambda fail: self._on_auth_error(fail, generation))
@@ -274,6 +279,79 @@ class SimpleTrader:
             return ProtoOATrendbarPeriod.Value(tf)
         except Exception:
             return ProtoOATrendbarPeriod.Value("M30")
+
+    def _send_refresh_token_request(self):
+        """Send ProtoOARefreshTokenReq — runs in reactor thread."""
+        req = ProtoOARefreshTokenReq()
+        req.refreshToken = self.refresh_token
+        d = self.client.send(req, responseTimeoutInSeconds=15)
+        d.addCallbacks(self._on_refresh_token_success, self._on_refresh_token_error)
+
+    def _on_refresh_token_success(self, response):
+        try:
+            parsed = Protobuf.extract(response)
+            new_access = getattr(parsed, "accessToken", None)
+            new_refresh = getattr(parsed, "refreshToken", None)
+            if new_access:
+                self.access_token = new_access
+                if new_refresh:
+                    self.refresh_token = new_refresh
+                logger.info("Access token refreshed successfully")
+                with self._refresh_lock:
+                    if self._refresh_pending is not None:
+                        self._refresh_pending["event"].set()
+            else:
+                err = f"Refresh response missing accessToken: {type(parsed).__name__}"
+                logger.error(err)
+                with self._refresh_lock:
+                    if self._refresh_pending is not None:
+                        self._refresh_pending["error"] = err
+                        self._refresh_pending["event"].set()
+        except Exception as e:
+            logger.error(f"Error parsing refresh token response: {e}")
+            with self._refresh_lock:
+                if self._refresh_pending is not None:
+                    self._refresh_pending["error"] = str(e)
+                    self._refresh_pending["event"].set()
+
+    def _on_refresh_token_error(self, failure):
+        err = str(failure.value) if hasattr(failure, "value") else str(failure)
+        logger.error(f"Refresh token request failed: {err}")
+        with self._refresh_lock:
+            if self._refresh_pending is not None:
+                self._refresh_pending["error"] = err
+                self._refresh_pending["event"].set()
+
+    async def _refresh_access_token(self):
+        """Refresh the access token using the stored refresh token. Requires CTRADER_REFRESH_TOKEN env."""
+        if not self.refresh_token:
+            raise Exception("No refresh token available — set CTRADER_REFRESH_TOKEN env var")
+
+        import threading as th
+        event = th.Event()
+        with self._refresh_lock:
+            self._refresh_pending = {"event": event, "error": None}
+
+        try:
+            logger.info("Refreshing cTrader access token...")
+            reactor.callFromThread(self._send_refresh_token_request)
+
+            loop = asyncio.get_event_loop()
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, event.wait),
+                    timeout=20.0
+                )
+            except asyncio.TimeoutError:
+                raise Exception("Timeout waiting for refresh token response")
+
+            with self._refresh_lock:
+                error = self._refresh_pending["error"] if self._refresh_pending else None
+            if error:
+                raise Exception(f"Refresh token failed: {error}")
+        finally:
+            with self._refresh_lock:
+                self._refresh_pending = None
 
     def fetch_m30_trendbars(self, pair: str, weeks: int = 6) -> pd.DataFrame:
         # This path is now event-driven via callbacks. Keep method for compatibility tests.
@@ -405,9 +483,15 @@ class SimpleTrader:
         # First attempt
         result = await self._send_trendbar_request(pair, symbol_id, timeframe, weeks)
 
-        # If empty, re-authenticate and retry once (session may have gone stale)
+        # If empty, the session may be stale or the access token expired.
+        # Refresh the access token (if we have a refresh token), re-auth, then retry.
         if result is None or result.empty:
-            logger.warning(f"Empty trendbars for {pair}, re-authenticating and retrying...")
+            logger.warning(f"Empty trendbars for {pair}, refreshing token and retrying...")
+            if self.refresh_token:
+                try:
+                    await self._refresh_access_token()
+                except Exception as e:
+                    logger.error(f"Token refresh failed: {e}")
             await self._reauth_and_wait()
             result = await self._send_trendbar_request(pair, symbol_id, timeframe, weeks)
 

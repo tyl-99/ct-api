@@ -1397,7 +1397,7 @@ class SimpleTrader:
             chrome_options.add_argument("--disable-gpu")
             chrome_options.add_argument("--window-size=1920,1080")
             chrome_options.add_argument(
-                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
             chrome_options.add_argument("--disable-extensions")
             chrome_options.add_argument("--disable-software-rasterizer")
@@ -1471,12 +1471,26 @@ class SimpleTrader:
                     continue
             if not table_ready:
                 logger.warning("ForexFactory calendar table not found with known selectors")
-                # Log page source snippet for debugging
+                # Log diagnostic info at WARNING level so Railway surfaces it
                 try:
-                    src = driver.page_source[:2000]
-                    logger.debug(f"Page source preview: {src}")
-                except Exception:
-                    pass
+                    title = driver.title
+                    current_url = driver.current_url
+                    page_len = len(driver.page_source)
+                    # Check for common block/challenge indicators
+                    src_lower = driver.page_source.lower()
+                    indicators = []
+                    for marker in ("cloudflare", "captcha", "challenge", "access denied",
+                                   "blocked", "forbidden", "just a moment"):
+                        if marker in src_lower:
+                            indicators.append(marker)
+                    logger.warning(
+                        f"FF page diagnostic — title='{title}', url='{current_url}', "
+                        f"page_len={page_len}, block_indicators={indicators}"
+                    )
+                    # Log first 1500 chars at warning level for visibility
+                    logger.warning(f"FF page head: {driver.page_source[:1500]}")
+                except Exception as e:
+                    logger.warning(f"Could not extract page diagnostic: {e}")
 
             events = []
             # Try multiple row selectors

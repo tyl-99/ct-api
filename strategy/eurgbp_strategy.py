@@ -30,14 +30,14 @@ class EURGBPStrategy:
     def __init__(self, target_pair="EUR/GBP",
                  zone_lookback=300,
                  base_max_candles=4,
-                 move_min_ratio=3.5,
-                 zone_width_max_pips=18,
+                 move_min_ratio=2.5,
+                 zone_width_max_pips=25,
                  risk_reward_ratio=3.0, # Set back to 3.0 for 1:3 R:R
                  sl_buffer_pips=4.0,
                  ema_periods: Optional[List[int]] = None,
                  rsi_period: int = 14,
-                 rsi_oversold: float = 30.0,
-                 rsi_overbought: float = 70.0,
+                 rsi_oversold: float = 25.0,
+                 rsi_overbought: float = 75.0,
                  enable_volume_filter: bool = False,
                  min_volume_factor: float = 1.2,
                  session_hours_utc: Optional[List[str]] = ("00:00-00:59", "02:00-02:59", "05:00-05:59", "07:00-12:59", "16:00-19:59", "22:00-22:59"),
@@ -406,7 +406,7 @@ class EURGBPStrategy:
                 # Determine rough trend based on last impulse for the latest zone
                 latest_zone = None
                 if self.zones:
-                    latest_zone = self.zones[-1] # Assuming zones are sorted by creation_at_index ascending
+                    latest_zone = self.zones[0] # zones sorted newest-first (reverse=True)
 
                 if latest_zone and latest_zone.get('type') == 'demand': # Bullish bias
                     if current_price < current_ema:
@@ -427,7 +427,7 @@ class EURGBPStrategy:
         # Rest of RSI logic
         latest_zone = None
         if self.zones:
-            latest_zone = self.zones[-1]
+            latest_zone = self.zones[0]
 
         if latest_zone and latest_zone.get('type') == 'demand': # Bullish bias
             if current_rsi > self.rsi_overbought:
@@ -456,7 +456,7 @@ class EURGBPStrategy:
             news_sentiment = self._get_news_sentiment(current_datetime)
             latest_zone = None
             if self.zones:
-                latest_zone = self.zones[-1]
+                latest_zone = self.zones[0]
             
             if latest_zone and latest_zone.get('type') == 'demand' and news_sentiment == "Bearish":
                 self.blocking_reasons_counts["Demand trade filtered by bearish news sentiment"] += 1

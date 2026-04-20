@@ -30,18 +30,18 @@ class GBPUSDStrategy:
     def __init__(self, target_pair="GBP/USD",
                  zone_lookback=300,
                  base_max_candles=4,
-                 move_min_ratio=3.5,
-                 zone_width_max_pips=18,
+                 move_min_ratio=2.5,
+                 zone_width_max_pips=25,
                  risk_reward_ratio=3.0, # Set back to 3.0 for 1:3 R:R
                  sl_buffer_pips=4.0,
                  ema_periods: Optional[List[int]] = None,
                  rsi_period: int = 14,
-                 rsi_oversold: float = 30.0,
-                 rsi_overbought: float = 70.0,
+                 rsi_oversold: float = 25.0,
+                 rsi_overbought: float = 75.0,
                  enable_volume_filter: bool = False,
                  min_volume_factor: float = 1.2,
                  session_hours_utc: Optional[List[str]] = ("01:00-02:59", "05:00-07:59", "09:00-09:59", "12:00-12:59", "15:00-15:59", "17:00-17:59", "19:00-19:59", "21:00-23:59"),
-                 enable_session_hours_filter: bool = True,
+                 enable_session_hours_filter: bool = False,
                  enable_news_sentiment_filter: bool = False
                  ):
         self.target_pair = target_pair
@@ -394,7 +394,7 @@ class GBPUSDStrategy:
                 # Determine rough trend based on last impulse for the latest zone
                 latest_zone = None
                 if self.zones:
-                    latest_zone = self.zones[-1] # Assuming zones are sorted by creation_at_index ascending
+                    latest_zone = self.zones[0] # zones sorted newest-first (reverse=True)
 
                 if latest_zone and latest_zone.get('type') == 'demand': # Bullish bias
                     if current_price < current_ema:
@@ -414,7 +414,7 @@ class GBPUSDStrategy:
         # Rest of RSI logic
         latest_zone = None
         if self.zones:
-            latest_zone = self.zones[-1]
+            latest_zone = self.zones[0]
 
         if latest_zone and latest_zone.get('type') == 'demand': # Bullish bias
             if current_rsi > self.rsi_overbought:
@@ -442,7 +442,7 @@ class GBPUSDStrategy:
             news_sentiment = self._get_news_sentiment(current_datetime)
             latest_zone = None
             if self.zones:
-                latest_zone = self.zones[-1]
+                latest_zone = self.zones[0]
             
             if latest_zone and latest_zone.get('type') == 'demand' and news_sentiment == "Bearish":
                 self.blocking_reasons_counts["Demand trade filtered by bearish news sentiment"] += 1
